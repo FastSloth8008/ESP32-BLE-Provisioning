@@ -1,0 +1,87 @@
+#include <stdio.h>
+#include <string.h>
+#include "esp_wifi.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "wifi_provisioning/manager.h"
+#include "wifi_provisioning/scheme_ble.h"
+#include "esp_event.h"
+#include "freertos/event_groups.h"
+
+#define EXAMPLE_WIFI_SSID      "myssid"
+#define EXAMPLE_WIFI_PASS      "mypassword"
+
+static const char *TAG = "provisioning_app";
+static EventGroupHandle_t wifi_event_group;
+const int WIFI_CONNECTED_BIT = BIT0;
+
+static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_base == WIFI_PROV_EVENT && event_id == WIFI_PROV_START) {
+        ESP_LOGI(TAG, "Provisioning started");
+    } else if (event_base == WIFI_PROV_EVENT && event_id == WIFI_PROV_CRED_RECV) {
+        wifi_sta_config_t *wifi_sta_cfg = (wifi_sta_config_t *)event_data;
+        ESP_LOGI(TAG, "Received Wi-Fi credentials SSID %s, Password %s",
+                 (const char *) wifi_sta_cfg->ssid,
+                 (const char *) wifi_sta_cfg->password);
+    } else if (event_base == WIFI_PROV_EVENT && event_id == WIFI_PROV_END) {
+        ESP_LOGI(TAG, "Provisioning ended");
+        wifi_prov_mgr_stop();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGI(TAG, "Disconnected. Connecting to the AP again...");
+        esp_wifi_connect();
+        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ESP_LOGI(TAG, "Got IP Address");
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+void wifi_init_sta(void) {
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL);
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_start();
+}
+
+void app_main(void) {
+    // Initialize NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+      ESP_ERROR_CHECK(nvs_flash_erase());
+      ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // Initialize the event loop
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // Initialize Wi-Fi provisioning
+    wifi_prov_mgr_config_t config = {
+        .scheme = wifi_prov_scheme_ble,
+        .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_NONE,
+    };
+
+    wifi_prov_mgr_init(config);
+
+    // Start BLE Provisioning
+    ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(WIFI_PROV_SCHEME_BLE, "MyESP32_Provisioning", NULL, NULL));
+    ESP_LOGI(TAG, "BLE Provisioning started. Connect to it via the mobile app.");
+
+    // Initialize Wi-Fi
+    wifi_init_sta();
+
+    // Wait for provisioning to finish
+    EventBits_t bits = xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, false, true, portMAX_DELAY);
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "Wi-Fi connected successfully");
+    } else {
+        ESP_LOGI(TAG, "Wi-Fi connection failed");
+    }
+
+    // Deinitialize provisioning manager after provisioning is complete
+    wifi_prov_mgr_deinit();
+}
